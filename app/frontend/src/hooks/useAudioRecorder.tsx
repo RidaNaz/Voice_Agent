@@ -8,7 +8,7 @@ type Parameters = {
 };
 
 export default function useAudioRecorder({ onAudioRecorded }: Parameters) {
-    const audioRecorder = useRef<Recorder>();
+    const audioRecorder = useRef<Recorder | undefined>(undefined);
 
     let buffer = new Uint8Array();
 

@@ -5,7 +5,7 @@ import { Player } from "@/components/audio/player";
 const SAMPLE_RATE = 24000;
 
 export default function useAudioPlayer() {
-    const audioPlayer = useRef<Player>();
+    const audioPlayer = useRef<Player | undefined>(undefined);
 
     const reset = () => {
         audioPlayer.current = new Player();

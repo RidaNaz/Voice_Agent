@@ -1,11 +1,7 @@
 import re
 from typing import Any
-
-from azure.core.credentials import AzureKeyCredential
-from azure.identity import DefaultAzureCredential
-from azure.search.documents.aio import SearchClient
-from azure.search.documents.models import VectorizableTextQuery
-
+import google.generativeai as genai
+from pinecone import Pinecone
 from rtmt import RTMiddleTier, Tool, ToolResult, ToolResultDirection
 
 _search_tool_schema = {
@@ -50,69 +46,76 @@ _grounding_tool_schema = {
 }
 
 async def _search_tool(
-    search_client: SearchClient, 
-    semantic_configuration: str | None,
-    identifier_field: str,
-    content_field: str,
-    embedding_field: str,
-    use_vector_query: bool,
+    pinecone_index,
+    genai_model,
     args: Any) -> ToolResult:
     print(f"Searching for '{args['query']}' in the knowledge base.")
-    # Hybrid query using Azure AI Search with (optional) Semantic Ranker
-    vector_queries = []
-    if use_vector_query:
-        vector_queries.append(VectorizableTextQuery(text=args['query'], k_nearest_neighbors=50, fields=embedding_field))
-    search_results = await search_client.search(
-        search_text=args["query"], 
-        query_type="semantic" if semantic_configuration else "simple",
-        semantic_configuration_name=semantic_configuration,
-        top=5,
-        vector_queries=vector_queries,
-        select=", ".join([identifier_field, content_field])
+    
+    # Generate embedding for the query using Gemini
+    embedding = genai_model.embed_content(
+        content=args["query"],
+        task_type="retrieval_query"
     )
+    
+    # Query Pinecone
+    results = pinecone_index.query(
+        vector=embedding["embedding"],
+        top_k=5,
+        include_metadata=True
+    )
+    
     result = ""
-    async for r in search_results:
-        result += f"[{r[identifier_field]}]: {r[content_field]}\n-----\n"
+    for match in results.matches:
+        result += f"[{match.id}]: {match.metadata['content']}\n-----\n"
+    
     return ToolResult(result, ToolResultDirection.TO_SERVER)
 
 KEY_PATTERN = re.compile(r'^[a-zA-Z0-9_=\-]+$')
 
 # TODO: move from sending all chunks used for grounding eagerly to only sending links to 
 # the original content in storage, it'll be more efficient overall
-async def _report_grounding_tool(search_client: SearchClient, identifier_field: str, title_field: str, content_field: str, args: Any) -> None:
+async def _report_grounding_tool(pinecone_index, args: Any) -> None:
     sources = [s for s in args["sources"] if KEY_PATTERN.match(s)]
     list = " OR ".join(sources)
     print(f"Grounding source: {list}")
     # Use search instead of filter to align with how detailt integrated vectorization indexes
     # are generated, where chunk_id is searchable with a keyword tokenizer, not filterable 
-    search_results = await search_client.search(search_text=list, 
-                                                search_fields=[identifier_field], 
-                                                select=[identifier_field, title_field, content_field], 
-                                                top=len(sources), 
-                                                query_type="full")
+    results = pinecone_index.query(
+        vector=list,
+        top_k=len(sources),
+        include_metadata=True
+    )
     
     # If your index has a key field that's filterable but not searchable and with the keyword analyzer, you can 
     # use a filter instead (and you can remove the regex check above, just ensure you escape single quotes)
     # search_results = await search_client.search(filter=f"search.in(chunk_id, '{list}')", select=["chunk_id", "title", "chunk"])
 
     docs = []
-    async for r in search_results:
-        docs.append({"chunk_id": r[identifier_field], "title": r[title_field], "chunk": r[content_field]})
+    for match in results.matches:
+        docs.append({"chunk_id": match.id, "title": match.metadata['title'], "chunk": match.metadata['content']})
     return ToolResult({"sources": docs}, ToolResultDirection.TO_CLIENT)
 
 def attach_rag_tools(rtmt: RTMiddleTier,
-    credentials: AzureKeyCredential | DefaultAzureCredential,
-    search_endpoint: str, search_index: str,
-    semantic_configuration: str | None,
-    identifier_field: str,
-    content_field: str,
-    embedding_field: str,
-    title_field: str,
-    use_vector_query: bool
+    pinecone_api_key: str,
+    pinecone_environment: str,
+    pinecone_index_name: str,
+    gemini_api_key: str
     ) -> None:
-    if not isinstance(credentials, AzureKeyCredential):
-        credentials.get_token("https://search.azure.com/.default") # warm this up before we start getting requests
-    search_client = SearchClient(search_endpoint, search_index, credentials, user_agent="RTMiddleTier")
+    
+    # Initialize Pinecone with new syntax
+    pc = Pinecone(api_key=pinecone_api_key)
+    index = pc.Index(pinecone_index_name)
+    
+    # Initialize Gemini
+    genai.configure(api_key=gemini_api_key)
+    model = genai.GenerativeModel('gemini-pro')
+    embedding_model = genai.GenerativeModel('embedding-001')
 
-    rtmt.tools["search"] = Tool(schema=_search_tool_schema, target=lambda args: _search_tool(search_client, semantic_configuration, identifier_field, content_field, embedding_field, use_vector_query, args))
-    rtmt.tools["report_grounding"] = Tool(schema=_grounding_tool_schema, target=lambda args: _report_grounding_tool(search_client, identifier_field, title_field, content_field, args))
+    rtmt.tools["search"] = Tool(
+        schema=_search_tool_schema, 
+        target=lambda args: _search_tool(index, embedding_model, args)
+    )
+    rtmt.tools["report_grounding"] = Tool(
+        schema=_grounding_tool_schema, 
+        target=lambda args: _report_grounding_tool(index, args)
+    )
